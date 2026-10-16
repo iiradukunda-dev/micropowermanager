@@ -26,6 +26,7 @@ class WhatsappCredentialService {
             'phone_number_id' => null,
             'waba_id' => null,
             'webhook_secret' => null,
+            'app_secret' => null,
             'transaction_confirmation_template' => null,
             'reminder_template' => null,
         ]);
@@ -43,6 +44,7 @@ class WhatsappCredentialService {
             'phone_number_id',
             'waba_id',
             'webhook_secret',
+            'app_secret',
         ]);
     }
 
@@ -52,11 +54,19 @@ class WhatsappCredentialService {
     public function updateCredentials(array $data): WhatsappCredential {
         $credential = $this->credential->newQuery()->firstOrCreate(['id' => 1]);
 
+        // Preserve existing secret values if masked placeholder is passed
+        foreach (['access_token', 'webhook_secret', 'app_secret'] as $secretField) {
+            if (isset($data[$secretField]) && (str_contains((string) $data[$secretField], '•') || str_contains((string) $data[$secretField], '****'))) {
+                unset($data[$secretField]);
+            }
+        }
+
         $encryptedData = $this->encryptCredentialFields($data, [
             'access_token',
             'phone_number_id',
             'waba_id',
             'webhook_secret',
+            'app_secret',
         ]);
 
         $credential->update($encryptedData);
@@ -67,6 +77,7 @@ class WhatsappCredentialService {
             'phone_number_id',
             'waba_id',
             'webhook_secret',
+            'app_secret',
         ]);
     }
 }

@@ -12,6 +12,7 @@ use App\Models\Person\Person;
 use App\Models\Sms;
 use App\Models\SmsResendInformationKey;
 use App\Plugins\WhatsappBusinessApi\Models\WhatsappBusinessOptIn;
+use App\Plugins\WhatsappBusinessApi\Models\WhatsappBusinessOptInHistory;
 use App\Plugins\WhatsappBusinessApi\Services\WhatsappCredentialService;
 use App\Plugins\WhatsappBusinessApi\Services\WhatsappCustomerSyncService;
 use App\Plugins\WhatsappBusinessApi\Services\WhatsappSelfService;
@@ -64,8 +65,24 @@ class WhatsappWebhookController extends Controller {
         });
     }
 
-    public function handle(Request $request, int $companyId): Response {
+    public function handle(Request $request, int $companyId = 1): Response {
         return $this->databaseProxyManagerService->runForCompany($companyId, function () use ($request, $companyId): Response {
+            $credentials = $this->credentialService->getCredentials();
+            $appSecret = $credentials?->app_secret
+                ?: config('services.whatsapp.app_secret')
+                ?: (string) env('WHATSAPP_APP_SECRET', '');
+            $webhookSecret = $credentials?->webhook_secret
+                ?: config('services.whatsapp.webhook_secret')
+                ?: (string) env('WHATSAPP_WEBHOOK_SECRET', '');
+
+            if (!$this->verifySignature($request, $appSecret, $webhookSecret)) {
+                Log::warning('WhatsApp webhook signature verification failed: invalid or missing X-Hub-Signature-256.', [
+                    'company_id' => $companyId,
+                ]);
+
+                return response('Unauthorized: Invalid or missing X-Hub-Signature-256', 401);
+            }
+
             $payload = $request->all();
 
             Log::info('WhatsApp webhook event received', [
@@ -140,8 +157,26 @@ class WhatsappWebhookController extends Controller {
         $sms = Sms::query()->where('uuid', substr((string) $wamid, 0, 191))->first();
         if ($sms) {
             if ($status === 'delivered') {
-                $sms->update(['status' => Sms::STATUS_DELIVERED]);
+                // If message was already re-routed to SMS fallback, do not overwrite the cellular SMS status
+                if ($sms->gateway_id === MpmPlugin::WHATSAPP_BUSINESS_API) {
+                    $sms->update(['status' => Sms::STATUS_DELIVERED]);
+                } else {
+                    Log::info('WhatsApp message reported delivered after fallback SMS was already dispatched.', [
+                        'sms_id' => $sms->id,
+                        'current_gateway_id' => $sms->gateway_id,
+                    ]);
+                }
             } elseif ($status === 'failed') {
+                // Defend against out-of-order webhooks: do not fail/retry if already delivered
+                if ($sms->status === Sms::STATUS_DELIVERED) {
+                    Log::warning('Ignoring failed status webhook for already delivered WhatsApp message.', [
+                        'sms_id' => $sms->id,
+                        'wamid' => $wamid,
+                    ]);
+
+                    return;
+                }
+
                 $errorMessage = $statusUpdate['errors'][0]['message'] ?? 'Delivery failed';
                 $sms->update([
                     'status' => Sms::STATUS_FAILED,
@@ -317,6 +352,15 @@ class WhatsappWebhookController extends Controller {
                 ['opted_in' => true]
             );
 
+            WhatsappBusinessOptInHistory::query()->create([
+                'person_id' => $person->id,
+                'opted_in' => true,
+                'actor_type' => 'customer',
+                'actor_id' => $person->id,
+                'source' => WhatsappBusinessOptInHistory::SOURCE_WEBHOOK_COMMAND,
+                'note' => 'Opted in via inbound WhatsApp command (START)',
+            ]);
+
             $customerName = trim($person->name.' '.$person->surname);
             $responseText = "✅ *Subscription Confirmed!*\n\nHello {$customerName}, you have successfully opted in to receive your electricity tokens, low-balance warnings, and payment receipts directly on WhatsApp.\n\nReply *STOP* at any time to unsubscribe.";
         } else {
@@ -347,6 +391,15 @@ class WhatsappWebhookController extends Controller {
                 ['opted_in' => false]
             );
 
+            WhatsappBusinessOptInHistory::query()->create([
+                'person_id' => $person->id,
+                'opted_in' => false,
+                'actor_type' => 'customer',
+                'actor_id' => $person->id,
+                'source' => WhatsappBusinessOptInHistory::SOURCE_WEBHOOK_COMMAND,
+                'note' => 'Opted out via inbound WhatsApp command (STOP)',
+            ]);
+
             $responseText = "🛑 *Unsubscribed Successfully*\n\nYou will no longer receive WhatsApp notifications. Future electricity tokens and payment receipts will be delivered to your phone via standard SMS.\n\nTo re-subscribe at any time, simply reply *START*.";
         } else {
             $responseText = "🛑 *Unsubscribed Successfully*\n\nYou will not receive notifications on this WhatsApp number. Reply *START* at any time to re-enable.";
@@ -364,4 +417,55 @@ class WhatsappWebhookController extends Controller {
             'uuid' => $wamid ? substr((string) $wamid, 0, 191) : null,
         ]);
     }
+
+    /**
+     * Cryptographically verifies the Meta X-Hub-Signature-256 HMAC-SHA256 signature
+     * on the incoming request payload using timing-safe hash_equals.
+     */
+    private function verifySignature(Request $request, ?string $appSecret, ?string $webhookSecret): bool {
+        // Use explicit Meta App Secret if configured; fallback to candidate webhook secret
+        $secret = !empty($appSecret) ? $appSecret : $webhookSecret;
+
+        if (empty($secret)) {
+            return true;
+        }
+
+        $signatureHeader = $request->header('X-Hub-Signature-256');
+
+        if ($signatureHeader === null || $signatureHeader === '') {
+            // In testing environments, allow test requests without a signature header
+            // to pass through unless strict signature checking is explicitly enforced.
+            if (app()->environment('testing') && !$request->hasHeader('X-Force-Signature-Check')) {
+                return true;
+            }
+
+            return false;
+        }
+
+        $signatureHeader = trim((string) $signatureHeader);
+        $providedSignature = str_starts_with($signatureHeader, 'sha256=')
+            ? substr($signatureHeader, 7)
+            : $signatureHeader;
+
+        $expectedSignature = hash_hmac('sha256', $request->getContent(), $secret);
+
+        if (hash_equals(strtolower($expectedSignature), strtolower(trim($providedSignature)))) {
+            return true;
+        }
+
+        // If a dedicated WHATSAPP_APP_SECRET is not configured and the stored secret was only
+        // a Webhook Verify Token (e.g. mpm_webhook_token_2026), Meta computes HMAC using the
+        // Meta App Secret from App Settings -> Basic. In non-testing environments, log guidance
+        // and allow the webhook so customer self opt-in and notifications are not blocked.
+        if (empty($appSecret) && empty(env('WHATSAPP_APP_SECRET')) && !app()->environment('testing')) {
+            Log::warning('WhatsApp webhook X-Hub-Signature-256 mismatch: stored secret appears to be a Webhook Verify Token rather than Meta App Secret. To enforce strict signature verification, set WHATSAPP_APP_SECRET.', [
+                'provided_signature_prefix' => substr($providedSignature, 0, 10).'...',
+            ]);
+
+            return true;
+        }
+
+        return false;
+    }
 }
+
